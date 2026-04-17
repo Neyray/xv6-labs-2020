@@ -8,5 +8,6 @@ struct buf {
   struct buf *prev; // LRU cache list
   struct buf *next;
   uchar data[BSIZE];
+  uint timestamp;   //原先做法是通过“在全局链表里挪位置”表示新旧顺序,现在使用时间戳来表示
 };
 
