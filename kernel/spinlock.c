@@ -58,6 +58,7 @@ initlock(struct spinlock *lk, char *name)
 
 // Acquire the lock.
 // Loops (spins) until the lock is acquired.
+// acquire函数将swap包装在一个循环中，直到它获得了锁前一直重试（自旋）
 void
 acquire(struct spinlock *lk)
 {
@@ -73,7 +74,11 @@ acquire(struct spinlock *lk)
   //   a5 = 1
   //   s1 = &lk->locked
   //   amoswap.w.aq a5, a5, (s1)
-  while(__sync_lock_test_and_set(&lk->locked, 1) != 0) {
+  //
+  //   每次迭代将1与lk->locked进行swap操作，并检查lk->locked之前的值
+  //   如果之前为0，swap已经把lk->locked设置为1，那么我们就获得了锁；如果前一个值是1，那么另一个CPU持有锁
+  //   原子地将1与lk->locked进行swap的事实并没有改变它的值
+  while(__sync_lock_test_and_set(&lk->locked, 1) != 0) {     //使用可移植的C库调用归结为amoswap的指令__sync_lock_test_and_set
 #ifdef LAB_LOCK
     __sync_fetch_and_add(&(lk->nts), 1);
 #else
