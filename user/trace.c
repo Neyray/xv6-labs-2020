@@ -19,6 +19,9 @@ main(int argc, char *argv[])
     exit(1);
   }
   
+  //trace.c 存完 mask 后，继续调用 exec 把自己变成 grep。
+  //注意：exec 不会换进程，它只换进程的内存内容，所以 proc 结构体还是同一个，trace_mask = 32 仍然在。
+  //这就是为什么 trace 设一次、后面整个 grep 运行都生效。 
   for(i = 2; i < argc && i < MAXARG; i++){
     nargv[i-2] = argv[i];
   }

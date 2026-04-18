@@ -131,6 +131,9 @@ static uint64 (*syscalls[])(void) = {
 [SYS_trace]   sys_trace,
 };
 
+
+//syscalls[] 存的是函数指针（sys_read 的地址），没法反查"5 号对应的名字是啥"。
+//所以要再平行地开一个字符串数组，下标与 syscalls[] 对齐。
 static char *syscalls_name[] = {
 	[SYS_fork]    "fork",
 	[SYS_exit]    "exit",
@@ -156,19 +159,29 @@ static char *syscalls_name[] = {
 	[SYS_trace]   "trace",
 };
 
+
+//trace 32 grep hello README 
+//trace 追踪的不是 grep，而是 grep 运行期间发生的系统调用
 void
 syscall(void)
 {
   int num;
   struct proc *p = myproc();
 
-  num = p->trapframe->a7;
+  //从 trapframe 读出 22 或者从之后的指令读出设定的值（例如read就是5）
+  //a0 = 32、a7 = 22（a0表示输入的数字，a7则是固定的寄存器，存储指令被设置的编号）
+  num = p->trapframe->a7;   // ← 当前正在执行的系统调用号
+
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     //执行系统调用并保存返回值到a0
     p->trapframe->a0 = syscalls[num]();
-
+     
+    //追踪打印逻辑
     //检查掩码：如果（1<<系统调用号）在掩码中，则打印
-    if((1<<num) & p->trace_mask){
+    //1 << num 的作用是生成一个只有第 num 位是 1 的数
+    //用户写 trace(32) 的意思不是"传个数字 32 进去"，而是"把第 5 号开关打开"
+    // 32 这个数字的含义是"我要追踪 5 号调用（也就是 read）"
+    if((1<<num) & p->trace_mask){          //这个进程想追踪哪些系统调用（之前 sys_trace 存的），用户写了 trace(32) → mask = 32
 	    printf("%d: syscall %s -> %d\n",p->pid,syscalls_name[num],p->trapframe->a0);
     }
   }
