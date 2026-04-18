@@ -291,6 +291,10 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  //在分配和初始化子进程np后
+  //将trace_mask拷贝到子进程
+  np->trace_mask=p->trace_mask;
+
   pid = np->pid;
 
   np->state = RUNNABLE;

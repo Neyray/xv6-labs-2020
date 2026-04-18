@@ -95,3 +95,15 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+//当用户调用 trace(mask) 时，内核会执行这个函数。
+//它的唯一作用就是把 mask 存到当前进程的 trace_mask 中
+uint64 sys_trace(void){
+	int mask;
+	//使用argint获取用户传进来的第0个参数
+	if(argint(0,&mask)<0){
+		return -1;
+	}
+	myproc()->trace_mask=mask;
+	return 0;
+}

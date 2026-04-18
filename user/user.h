@@ -23,6 +23,7 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+int trace(int);//在用户态声明函数原型
 
 // ulib.c
 int stat(const char*, struct stat*);
