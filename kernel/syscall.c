@@ -161,6 +161,7 @@ static char *syscalls_name[] = {
 
 
 //trace 32 grep hello README 
+//32表示追踪第5条指令
 //trace 追踪的不是 grep，而是 grep 运行期间发生的系统调用
 void
 syscall(void)
@@ -179,8 +180,10 @@ syscall(void)
     //追踪打印逻辑
     //检查掩码：如果（1<<系统调用号）在掩码中，则打印
     //1 << num 的作用是生成一个只有第 num 位是 1 的数
-    //用户写 trace(32) 的意思不是"传个数字 32 进去"，而是"把第 5 号开关打开"
-    // 32 这个数字的含义是"我要追踪 5 号调用（也就是 read）"
+    //用户写 trace(32) 的意思不是"传个数字 32 进去"，而是"把第 5 号开关打开"，32 这个数字的含义是"我要追踪 5 号调用（也就是 read）"
+    //
+    // trace_mask是一开始设置的追踪指令的数字，不会变
+    // num是当前的指令
     if((1<<num) & p->trace_mask){          //这个进程想追踪哪些系统调用（之前 sys_trace 存的），用户写了 trace(32) → mask = 32
 	    printf("%d: syscall %s -> %d\n",p->pid,syscalls_name[num],p->trapframe->a0);
     }
