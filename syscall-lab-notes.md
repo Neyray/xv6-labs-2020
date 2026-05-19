@@ -1,175 +1,262 @@
-# MIT xv6 Lab: syscall 分支实现说明
+# MIT xv6 Lab syscall 分支实现说明
 
-## 分支范围
+## 分支概览
 
-本文档对应仓库 `Neyray/xv6-labs-2020` 的 `syscall` 分支，重点根据当前分支中的 `trace` 实现和相关注释编写。
+`syscall` 分支重点完成了 `trace` 系统调用。它的作用是给进程设置一个系统调用追踪掩码，使进程后续执行指定系统调用时，内核打印追踪信息。
 
-从代码现状看，这个分支完整接入的是 `trace` 系统调用；同时存在 `kernel/sysinfo.h`，定义了 `struct sysinfo`，但暂未看到 `sys_sysinfo`、系统调用表、用户态桩等完整链路接入。因此本文会把 `sysinfo.h` 作为预留结构说明，而不把 `sysinfo` 写成已经完整完成的系统调用。
+当前分支中还存在 `kernel/sysinfo.h`，定义了 `struct sysinfo`，但没有看到完整的 `sysinfo` 系统调用链路。因此本文将 `sysinfo.h` 单独作为“预留结构”说明。
 
-## 实现的功能
+## 任务一：trace 系统调用
 
-### trace 系统调用
+### 实现的功能
 
-`trace(mask)` 的功能是：给当前进程设置一个系统调用追踪掩码。之后当前进程执行系统调用时，如果该系统调用号对应的 bit 被打开，内核就在系统调用返回后打印一行追踪信息。
+用户可以运行：
 
-输出格式为：
+```sh
+trace 32 grep hello README
+```
+
+这里 `32` 是掩码。因为 `32 == 1 << 5`，而 xv6 中 `SYS_read` 的系统调用号是 5，所以这个命令表示：追踪后续命令运行过程中触发的 `read` 系统调用。
+
+当被追踪的系统调用返回后，内核输出：
 
 ```text
 pid: syscall name -> return_value
 ```
 
-例如用户运行类似：
+### 核心修改代码片段
 
-```text
-trace 32 grep hello README
-```
+#### 1. 增加系统调用号
 
-其中 `32` 是二进制掩码，表示打开第 5 位，对应 xv6 中的 `SYS_read`。因此它追踪的不是 `grep` 程序本身这个名字，而是 `grep` 运行过程中触发的 `read` 系统调用。
-
-## 怎么实现的
-
-### 1. 为系统调用分配编号
-
-在 `kernel/syscall.h` 中新增：
+文件：`kernel/syscall.h`
 
 ```c
-#define SYS_trace 22
+#define SYS_trace  22
+//定义系统调用号
 ```
 
-这个编号会被用户态 syscall stub 放进 RISC-V 的 `a7` 寄存器。进入内核后，`syscall()` 从 `p->trapframe->a7` 取出系统调用号，并据此找到真正的内核处理函数。
+这个编号是用户态和内核态识别 `trace` 的共同约定。用户态把它放进 `a7` 寄存器，内核从 `trapframe->a7` 取出并分发。
 
-### 2. 生成用户态系统调用入口
+#### 2. 增加用户态声明和系统调用桩
 
-在 `user/usys.pl` 中加入：
+文件：`user/user.h`
+
+```c
+int trace(int);//在用户态声明函数原型
+```
+
+文件：`user/usys.pl`
 
 ```perl
 entry("trace");
 ```
 
-这样构建时会生成 `trace` 的汇编桩：把 `SYS_trace` 放入 `a7`，执行 `ecall` 进入内核，然后返回用户态。
+`usys.pl` 会生成汇编入口，使用户程序能够像调用普通函数一样调用 `trace(mask)`。真正进入内核靠的是生成代码里的 `ecall`。
 
-同时在 `user/user.h` 中声明：
+#### 3. 在进程结构中保存 trace_mask
 
-```c
-int trace(int);
-```
-
-这让用户程序可以像普通函数一样调用 `trace(mask)`。
-
-### 3. 在进程结构中保存追踪状态
-
-在 `kernel/proc.h` 的 `struct proc` 中新增：
+文件：`kernel/proc.h`
 
 ```c
-int trace_mask;
-```
-
-这个字段属于进程控制块，用来记录当前进程想追踪哪些系统调用。把追踪状态放在 `proc` 中的好处是，它天然跟随进程存在，不需要额外的全局表。
-
-### 4. 实现 sys_trace
-
-在 `kernel/sysproc.c` 中新增 `sys_trace()`：
-
-- 使用 `argint(0, &mask)` 读取用户传进来的第 0 个参数。
-- 参数读取失败时返回 `-1`。
-- 成功时将 `mask` 保存到 `myproc()->trace_mask`。
-- 返回 `0` 表示设置成功。
-
-这一步完成了“用户态 trace(mask) 参数进入内核并保存到当前进程”的核心路径。
-
-### 5. fork 时继承 trace_mask
-
-在 `kernel/proc.c` 的 `fork()` 中，分配并初始化子进程后增加：
-
-```c
-np->trace_mask = p->trace_mask;
-```
-
-这样通过 `fork` 创建出来的子进程会继承父进程的追踪设置。这个设计符合 lab 要求，也解释了为什么 `trace mask command` 这种包装器能够让后续执行的命令被追踪。
-
-### 6. 在 syscall 分发处打印追踪结果
-
-在 `kernel/syscall.c` 中做了两件事：
-
-- 给 `SYS_trace` 注册处理函数 `sys_trace`。
-- 新增 `syscalls_name[]`，用系统调用号反查系统调用名字。
-
-`syscall()` 原本只负责根据系统调用号调用 `syscalls[num]()`，并把返回值写回 `p->trapframe->a0`。现在在系统调用执行之后，增加掩码判断：
-
-```c
-if ((1 << num) & p->trace_mask) {
-  printf("%d: syscall %s -> %d\n", p->pid, syscalls_name[num], p->trapframe->a0);
-}
-```
-
-这里的核心是位图思想：`mask` 的第 `num` 位为 1，就表示追踪编号为 `num` 的系统调用。
-
-### 7. 用户态 trace 程序
-
-`user/trace.c` 负责把 shell 命令包装成可追踪执行：
-
-- 检查参数数量和 mask 格式。
-- 调用 `trace(atoi(argv[1]))` 设置当前进程的追踪掩码。
-- 把后续参数整理成新的 `argv`。
-- 调用 `exec(nargv[0], nargv)` 执行目标命令。
-
-代码注释中强调了一个关键点：`exec` 不会换掉 `proc` 结构，它只是替换当前进程的用户态地址空间。因此 `trace_mask` 仍然保留在同一个进程结构中，目标命令运行期间仍会被追踪。
-
-## 核心思想
-
-`syscall` 分支的核心是“打通一次完整的系统调用链路”：
-
-```text
-用户程序 trace(mask)
-  -> user/usys.pl 生成的 syscall stub
-  -> ecall
-  -> kernel/syscall.c 根据 a7 分发
-  -> kernel/sysproc.c::sys_trace 保存 mask
-  -> 后续 syscall 返回时按 mask 打印
-```
-
-这个实现把几个 xv6 关键概念串起来了：
-
-- `a7` 保存系统调用号。
-- `a0` 既可作为参数寄存器，也保存系统调用返回值。
-- `struct proc` 是保存进程级状态的合适位置。
-- `fork` 复制进程状态，`exec` 替换用户内存但保留进程结构。
-- 用位掩码可以用一个整数高效表达“追踪哪些系统调用”。
-
-## sysinfo.h 的代码现状
-
-当前分支有 `kernel/sysinfo.h`：
-
-```c
-struct sysinfo {
-  uint64 freemem;
-  uint64 nproc;
+struct proc {
+  ...
+  char name[16];               // Process name (debugging)
+  int trace_mask; //新增：用于存储trace掩码（在进程的PCB中加）
 };
 ```
 
-它定义了 `sysinfo` lab 所需的数据结构：空闲内存字节数和进程数量。不过当前分支没有完整看到以下配套内容：
+`trace_mask` 放在 `struct proc` 中，表示追踪设置是进程级状态。这样每个进程都可以有自己的追踪掩码。
 
-- `SYS_sysinfo` 系统调用编号。
-- `sys_sysinfo()` 内核实现。
-- `syscalls[]` 中的注册项。
-- `user/user.h` 中的用户态声明。
-- `user/usys.pl` 中的 `entry("sysinfo")`。
+#### 4. 实现 sys_trace
 
-所以它更像是 `sysinfo` 功能的准备工作，而完整实现仍需要继续接上内核统计和 `copyout` 返回用户态结构体。
+文件：`kernel/sysproc.c`
 
-## 关键文件
+```c
+//当用户调用 trace(mask) 时，内核会执行这个函数。
+//它的唯一作用就是把 mask 存到当前进程的 trace_mask 中
+uint64 sys_trace(void){
+  int mask;
+  //使用argint获取用户传进来的第0个参数
+  if(argint(0,&mask)<0){
+    return -1;
+  }
+  myproc()->trace_mask=mask;
+  return 0;
+}
+```
 
-- `kernel/syscall.h`：新增 `SYS_trace` 系统调用号。
-- `user/usys.pl`：生成 `trace` 用户态系统调用桩。
-- `user/user.h`：声明 `int trace(int)`。
-- `kernel/proc.h`：在 `struct proc` 中新增 `trace_mask`。
-- `kernel/proc.c`：在 `fork()` 中继承追踪掩码。
-- `kernel/sysproc.c`：实现 `sys_trace()`。
-- `kernel/syscall.c`：注册系统调用、维护系统调用名数组、执行追踪打印。
-- `user/trace.c`：用户态命令包装程序。
-- `kernel/sysinfo.h`：定义 `struct sysinfo`，当前属于预留/部分实现。
+这个函数负责从用户参数中取出 `mask`，然后保存到当前进程的 `trace_mask` 字段。
 
-## 小结
+#### 5. fork 时继承 trace_mask
 
-这个分支最有价值的部分是 `trace` 的完整系统调用闭环。它不仅添加了一个新 syscall，还展示了 xv6 中用户态、trapframe、系统调用表、进程结构和 fork/exec 语义之间的关系。核心并不是打印本身，而是理解“系统调用如何从用户态进入内核，又如何借助进程状态影响后续行为”。
+文件：`kernel/proc.c`
+
+```c
+//在分配和初始化子进程np后
+//将trace_mask拷贝到子进程
+np->trace_mask=p->trace_mask;
+```
+
+这样父进程设置过 trace 后，子进程也会继承同样的追踪设置。
+
+#### 6. 注册系统调用处理函数
+
+文件：`kernel/syscall.c`
+
+```c
+extern uint64 sys_trace(void);
+```
+
+```c
+static uint64 (*syscalls[])(void) = {
+  ...
+  [SYS_trace]   sys_trace,
+};
+```
+
+这一步把 `SYS_trace` 和真正的内核函数 `sys_trace` 关联起来。
+
+#### 7. 增加系统调用名表
+
+文件：`kernel/syscall.c`
+
+```c
+//syscalls[] 存的是函数指针（sys_read 的地址），没法反查"5 号对应的名字是啥"。
+//所以要再平行地开一个字符串数组，下标与 syscalls[] 对齐。
+static char *syscalls_name[] = {
+  [SYS_fork]    "fork",
+  [SYS_exit]    "exit",
+  [SYS_wait]    "wait",
+  [SYS_pipe]    "pipe",
+  [SYS_read]    "read",
+  ...
+  [SYS_trace]   "trace",
+};
+```
+
+系统调用表只能从编号找到函数，不能直接知道函数名字。为了打印 `read`、`write` 这种名字，额外维护了一个同下标的字符串数组。
+
+#### 8. 在 syscall 分发后打印追踪信息
+
+文件：`kernel/syscall.c`
+
+```c
+void
+syscall(void)
+{
+  int num;
+  struct proc *p = myproc();
+
+  //从 trapframe 读出系统调用号
+  num = p->trapframe->a7;
+
+  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+    //执行系统调用并保存返回值到a0
+    p->trapframe->a0 = syscalls[num]();
+
+    //追踪打印逻辑
+    //检查掩码：如果（1<<系统调用号）在掩码中，则打印
+    if((1<<num) & p->trace_mask){
+      printf("%d: syscall %s -> %d\n",
+             p->pid,syscalls_name[num],p->trapframe->a0);
+    }
+  }
+  else {
+    printf("%d %s: unknown sys call %d\n",
+            p->pid, p->name, num);
+    p->trapframe->a0 = -1;
+  }
+}
+```
+
+这里是 `trace` 的核心：系统调用先正常执行，返回值写入 `a0`，然后再判断当前系统调用号对应的 bit 是否在 `trace_mask` 中打开。如果打开，就打印追踪信息。
+
+### 用户态 trace 程序
+
+文件：`user/trace.c`
+
+```c
+if (trace(atoi(argv[1])) < 0) {
+  fprintf(2, "%s: trace failed\n", argv[0]);
+  exit(1);
+}
+
+//trace.c 存完 mask 后，继续调用 exec 把自己变成 grep。
+//注意：exec 不会换进程，它只换进程的内存内容，所以 proc 结构体还是同一个，trace_mask = 32 仍然在。
+//这就是为什么 trace 设一次、后面整个 grep 运行都生效。
+for(i = 2; i < argc && i < MAXARG; i++){
+  nargv[i-2] = argv[i];
+}
+exec(nargv[0], nargv);
+```
+
+`trace` 用户程序先给当前进程设置 `trace_mask`，再通过 `exec` 执行目标程序。`exec` 替换的是用户地址空间，不会换掉 `struct proc`，所以 `trace_mask` 能继续生效。
+
+### 怎么实现的
+
+完整链路是：
+
+```text
+user/trace.c 调用 trace(mask)
+  -> user/usys.pl 生成 trace syscall stub
+  -> ecall 进入内核
+  -> syscall.c 从 a7 取 SYS_trace
+  -> sysproc.c::sys_trace 保存 mask 到 proc
+  -> 后续 syscall 执行后按 mask 判断是否打印
+```
+
+### 核心思想
+
+`trace` 的核心不是打印，而是把系统调用机制串起来：
+
+- 用户态需要声明和 syscall stub。
+- 内核需要系统调用号和分发表。
+- 进程级状态放进 `struct proc`。
+- `fork` 要继承 `trace_mask`。
+- `exec` 不改变 `struct proc`，所以包装器程序设置的 mask 可以影响后续命令。
+- 位掩码用 `1 << num` 表示“是否追踪第 num 号系统调用”。
+
+## 任务二：sysinfo.h 预留结构
+
+### 当前代码片段
+
+文件：`kernel/sysinfo.h`
+
+```c
+struct sysinfo {
+  uint64 freemem;   // amount of free memory (bytes)
+  uint64 nproc;     // number of process
+};
+```
+
+### 当前完成状态
+
+这个结构体定义了 `sysinfo` lab 需要返回给用户态的信息：
+
+- `freemem`：空闲内存字节数。
+- `nproc`：当前进程数量。
+
+但当前分支里没有看到完整系统调用接入，例如：
+
+- `SYS_sysinfo` 编号。
+- `sys_sysinfo()` 实现。
+- `syscalls[]` 注册。
+- `user/user.h` 声明。
+- `user/usys.pl` 入口。
+
+所以它目前更像是为 `sysinfo` 做的结构准备，还不是完整功能。
+
+## 总结
+
+`syscall` 分支完成的主要任务是 `trace`。它展示了 xv6 新增系统调用的标准路径：分配编号、生成用户态入口、注册内核处理函数、保存进程级状态、在系统调用分发点扩展行为。
+
+其中最核心的片段是 `syscall.c` 中的判断：
+
+```c
+if((1<<num) & p->trace_mask){
+  printf("%d: syscall %s -> %d\n",p->pid,syscalls_name[num],p->trapframe->a0);
+}
+```
+
+这一行把 `trace(mask)` 的用户输入转化成了内核对后续系统调用的选择性追踪。
 
