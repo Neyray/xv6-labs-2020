@@ -1,88 +1,168 @@
-# MIT xv6 Lab: util 分支实现说明
+# MIT xv6 Lab util 分支实现说明
 
-## 分支范围
+## 分支概览
 
-本文档对应仓库 `Neyray/xv6-labs-2020` 的 `util` 分支，重点根据当前分支中的 `user/sleep.c`、`user/pingpong.c` 和 `Makefile` 编写。
+`util` 分支主要完成了两个用户态工具：
 
-这个分支完成了 util lab 中两个基础用户态程序：
+- 任务一：`sleep`，让当前用户进程休眠指定 tick 数。
+- 任务二：`pingpong`，用 pipe 完成父子进程之间的一次双向通信。
 
-- `sleep`：让用户进程休眠指定 tick 数。
-- `pingpong`：用 pipe 在父子进程之间完成一次双向通信。
+这部分没有改内核，重点是熟悉 xv6 用户程序如何调用系统调用，以及如何把新用户程序加入构建系统。
 
-## 实现的功能
+## 任务一：sleep
 
-### sleep
+### 实现的功能
 
-`sleep` 程序接收一个命令行参数，将它解释为 tick 数，并调用 xv6 已有的 `sleep` 系统调用让当前进程进入休眠。
+`sleep` 接收一个命令行参数，把它转换成整数 tick 数，然后调用 xv6 已有的 `sleep` 系统调用。
 
-实现行为如下：
+运行形式：
 
-- 如果用户没有传入 tick 参数，向标准错误输出 `Usage:sleep <ticks>`。
-- 使用 `atoi(argv[1])` 将字符串参数转换为整数。
-- 调用 `sleep(ticks)` 进入内核提供的睡眠逻辑。
-- 最后调用 `exit(0)` 结束用户程序。
+```sh
+sleep 10
+```
 
-对应文件是 `user/sleep.c`。代码里的注释把实现拆成了“检查参数、转换参数、调用系统调用、退出程序”四个步骤，结构比较清晰。
+表示当前进程休眠 10 个 tick。
 
-### pingpong
+### 核心修改代码片段
 
-`pingpong` 程序创建一个子进程，并通过两个管道完成父子进程之间的一次消息往返：
+文件：`user/sleep.c`
 
-- `p1` 表示父进程到子进程的管道。
-- `p2` 表示子进程到父进程的管道。
-- 父进程写入一个字节，子进程读到后打印 `received ping`。
-- 子进程再把这个字节写回父进程，父进程读到后打印 `received pong`。
+```c
+int
+main(int argc,char* argv[]){
+  //步骤1：检查参数个数，如果没有提供参数就提醒用户
+  if(argc<2){
+    fprintf(2,"Usage:sleep <ticks>\n");//2是报错文件标志符
+    exit(0);
+  }
 
-对应文件是 `user/pingpong.c`。程序使用 `pipe`、`fork`、`read`、`write`、`close`、`getpid`、`printf` 和 `exit` 这些用户态系统调用接口完成通信流程。
+  //步骤2：将字符串参数转换为整数
+  //argv[0]是程序名"sleep"，argv[1]才是用户输入的数字
+  int ticks=atoi(argv[1]);
 
-## 怎么实现的
+  //步骤3：添加sleep系统调用
+  sleep(ticks);
 
-### 1. 新增用户程序源文件
+  //步骤4：退出程序
+  exit(0);
+}
+```
 
-分支中新增了两个用户程序：
+文件：`Makefile`
 
-- `user/sleep.c`
-- `user/pingpong.c`
+```makefile
+UPROGS=\
+  ...
+  $U/_sleep\
+  ...
+```
 
-这两个文件都包含 xv6 用户程序常见的头文件：
+### 怎么实现的
 
-- `kernel/types.h`
-- `kernel/stat.h`
-- `user/user.h`
+`argv[0]` 是程序名，真正的参数从 `argv[1]` 开始，所以程序先检查 `argc < 2`。参数存在时，用 `atoi` 转成整数，再调用 `sleep(ticks)`。
 
-其中 `user/user.h` 提供用户态可调用的系统调用声明。
+这里的 `sleep` 不是自己实现计时，而是直接使用 xv6 内核已经提供的系统调用。用户程序只负责参数处理和调用入口。
 
-### 2. 修改 Makefile
+### 核心思想
 
-在 `Makefile` 的 `UPROGS` 列表中加入：
+这个任务的核心是理解“用户态程序通过 `user/user.h` 中声明的函数进入系统调用”。`sleep.c` 本身很短，但它展示了 xv6 用户程序的基本结构：参数检查、调用系统调用、退出。
 
-- `$U/_sleep`
-- `$U/_pingpong`
+## 任务二：pingpong
 
-这样 xv6 构建文件系统镜像时，会把这两个用户程序编译并打包进 `fs.img`，进入 xv6 shell 后就能直接运行 `sleep` 和 `pingpong`。
+### 实现的功能
 
-### 3. 使用已有系统调用完成用户态任务
+`pingpong` 创建一个子进程，父进程先向子进程发送一个字节，子进程收到后打印 `received ping`，再把字节发回父进程，父进程收到后打印 `received pong`。
 
-这个 lab 的重点不在修改内核，而是在用户态熟悉 xv6 的系统调用使用方式：
+预期输出类似：
 
-- `sleep` 直接调用已有的 `sleep` 系统调用。
-- `pingpong` 用 `pipe` 建立字节流通道，用 `fork` 创建父子进程，再用 `read/write` 做同步通信。
+```text
+子进程pid:received ping
+父进程pid:received pong
+```
 
-## 核心思想
+### 核心修改代码片段
 
-`util` 分支的核心是“用 xv6 提供的最小系统调用组合出有行为的用户程序”。
+文件：`user/pingpong.c`
 
-`sleep` 展示了用户程序如何接收 shell 参数、做简单参数转换，并调用系统调用进入内核。它的关键点是区分 `argv[0]` 是程序名，`argv[1]` 才是用户输入的 tick 数。
+```c
+int p1[2],p2[2];// p1: 父→子，p2: 子→父
 
-`pingpong` 展示了进程和管道的基本模型。由于 xv6 的 pipe 是单向字节流，所以父子双向通信需要两个 pipe。程序中及时关闭不使用的读端或写端，可以避免资源泄漏，也让父子进程之间的通信方向更明确。
+pipe(p1);
+pipe(p2);
 
-## 关键文件
+//创建子进程
+int pid=fork();
+```
 
-- `user/sleep.c`：实现 `sleep ticks` 用户程序。
-- `user/pingpong.c`：实现父子进程 pipe 双向通信。
-- `Makefile`：将 `_sleep` 和 `_pingpong` 加入用户程序构建列表。
+子进程核心逻辑：
 
-## 小结
+```c
+if(pid==0){
+  //子进程
+  close(p1[1]);//子进程不需要写p1
+  close(p2[0]);//子进程不需要读p2
 
-这个分支主要完成了 xv6 用户态编程的入门部分。实现规模不大，但覆盖了 xv6 用户程序最基本的能力：命令行参数、系统调用、进程创建、管道通信和进程退出。它为后续 syscall lab 中“从用户态穿过系统调用入口进入内核”打下了基础。
+  char buf[1];
+  //子进程读父进程
+  read(p1[0],buf,1);
+  printf("%d:received ping\n",getpid());
+  write(p2[1],buf,1);
+
+  close(p1[0]);
+  close(p2[1]);
+  exit(0);
+}
+```
+
+父进程核心逻辑：
+
+```c
+else{
+  //父进程
+  close(p1[0]);
+  close(p2[1]);
+
+  char buf[1]={'x'};
+  write(p1[1],buf,1);
+  read(p2[0],buf,1);
+  printf("%d:received pong\n",getpid());
+
+  close(p1[1]);
+  close(p2[0]);
+  exit(0);
+}
+```
+
+文件：`Makefile`
+
+```makefile
+UPROGS=\
+  ...
+  $U/_pingpong\
+  ...
+```
+
+### 怎么实现的
+
+因为 xv6 的 pipe 是单向通信通道，所以这里用了两个 pipe：
+
+- `p1`：父进程写，子进程读。
+- `p2`：子进程写，父进程读。
+
+`fork()` 后父子进程会同时拥有两个 pipe 的读写端。为了让通信方向清晰，也为了避免多余文件描述符一直占用，父子进程都会关闭自己不用的端口。
+
+### 核心思想
+
+这个任务的核心是进程间通信模型：`fork` 复制文件描述符，`pipe` 提供字节流，`read/write` 完成同步。
+
+父进程写入 `p1[1]` 后，子进程从 `p1[0]` 读；子进程再写入 `p2[1]`，父进程从 `p2[0]` 读。两个 pipe 刚好构成一次“ping-pong”往返。
+
+## 总结
+
+`util` 分支的两个任务都很小，但正好覆盖了 xv6 用户态编程最重要的入门能力：
+
+- `sleep` 练习命令行参数和系统调用。
+- `pingpong` 练习 `fork`、`pipe`、文件描述符和进程同步。
+
+真正的核心不是代码量，而是理解 xv6 中“用户程序如何借助系统调用使用内核能力”。
 
