@@ -1,197 +1,418 @@
-# MIT xv6 Lab: lock 分支实现说明
+# MIT xv6 Lab lock 分支实现说明
 
-## 分支范围
+## 分支概览
 
-本文档对应仓库 `Neyray/xv6-labs-2020` 的 `lock` 分支，重点根据当前分支中的 `kernel/kalloc.c`、`kernel/bio.c`、`kernel/buf.h` 和 `kernel/spinlock.c` 编写。
+`lock` 分支主要解决 xv6 中两个高竞争锁的问题：
 
-这个分支主要完成了 xv6 lock lab 的两个性能优化方向：
+- 任务一：优化物理内存分配器 `kalloc`，减少 `kmem` 锁竞争。
+- 任务二：优化 buffer cache，减少 `bcache` 锁竞争。
+- 任务三：补充 spinlock 竞争统计和自旋锁原理注释。
 
-- 优化物理内存分配器，减少 `kmem` 全局锁竞争。
-- 优化 buffer cache，减少 `bcache` 全局锁竞争。
+这个 lab 的核心不是新增功能，而是提高多 CPU 并发场景下的性能，同时保持内核数据结构的一致性。
 
-此外，分支中也对 `spinlock.c` 添加了锁统计和自旋锁原理相关注释。
+## 任务一：优化 kalloc 物理内存分配器
 
-## 实现的功能
+### 原始问题
 
-### 1. 每 CPU 物理页 freelist
+原始 xv6 只有一个全局空闲页链表和一把锁。多个 CPU 同时执行 `kalloc()` / `kfree()` 时，都会竞争同一把 `kmem.lock`。
 
-原始 xv6 的物理内存分配器只有一个全局 `kmem`：
+### 实现的功能
+
+当前分支将全局 freelist 改成每 CPU 一个 freelist：
+
+- 每个 CPU 有自己的 `kmem[id].freelist`。
+- 每个 CPU 有自己的 `kmem[id].lock`。
+- `kfree()` 把释放的页放回当前 CPU 的 freelist。
+- `kalloc()` 优先从当前 CPU freelist 分配。
+- 当前 CPU 没有空闲页时，从其他 CPU freelist 偷取一页。
+
+### 核心修改代码片段
+
+文件：`kernel/kalloc.c`
+
+#### 1. 将单个 kmem 改成 per-CPU 数组
 
 ```c
 struct {
   struct spinlock lock;
-  struct run *freelist;
-} kmem;
+  struct run *freelist;   //空闲列表受到自旋锁（spin lock）的保护
+} kmem[NCPU];    //把单个kmem改造成数组，每个CPU拥有独立的空闲链表+独立的锁
 ```
 
-多个 CPU 同时执行 `kalloc()` 或 `kfree()` 时，都会竞争同一把 `kmem.lock`。在高并发测试中，这会造成明显的锁争用。
-
-当前分支将它改成：
+#### 2. 初始化每个 CPU 的锁
 
 ```c
-struct {
-  struct spinlock lock;
-  struct run *freelist;
-} kmem[NCPU];
+void
+kinit()
+{
+  char lockname[8];
+  for(int i=0;i<NCPU;++i){
+    snprintf(lockname,sizeof(lockname),"kmem_%d",i);
+    initlock(&kmem[i].lock, "kmem");
+  }
+  freerange(end, (void*)PHYSTOP);
+}
 ```
 
-也就是每个 CPU 都拥有自己的空闲页链表和自己的锁。大多数情况下，一个 CPU 只操作自己的 freelist，从而把原先集中在一把锁上的竞争分散到多把锁上。
+#### 3. kfree 释放到当前 CPU 的 freelist
 
-### 2. 空闲页偷取机制
+```c
+void
+kfree(void *pa)
+{
+  struct run *r;
 
-每 CPU freelist 带来一个问题：某个 CPU 的链表可能为空，而其他 CPU 的链表还有空闲页。
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    panic("kfree");
 
-因此 `kalloc()` 中增加了 steal 逻辑：
+  memset(pa, 1, PGSIZE);
 
-- 先关闭中断并读取当前 CPU id。
-- 优先从当前 CPU 的 `kmem[id].freelist` 取页。
-- 如果当前 CPU 没有空闲页，就遍历其他 CPU 的 freelist。
-- 找到可用页后，从其他 CPU 的链表中取走一个页面。
-- 最后恢复中断。
+  r = (struct run*)pa;
 
-这个机制保证了局部性和可用性之间的平衡：平时尽量本地分配，本地没有时再跨 CPU 获取。
+  push_off();   //关中断（防止调用cpuid期间被调度到其他CPU）
+  int id=cpuid();
+  acquire(&kmem[id].lock);
+  r->next = kmem[id].freelist;
+  kmem[id].freelist = r;
+  release(&kmem[id].lock);
+  pop_off();    //开中断
+}
+```
 
-### 3. 哈希桶 buffer cache
+#### 4. kalloc 优先本地分配，不够就偷取
 
-原始 xv6 的 buffer cache 使用一条全局 LRU 链表，并由一把 `bcache.lock` 保护。所有 block cache 查找、引用计数更新、LRU 更新都会竞争这同一把锁。
+```c
+void *
+kalloc(void)
+{
+  struct run *r;
 
-当前分支将 buffer cache 改为哈希桶结构：
+  push_off();
+  int id=cpuid();
+  acquire(&kmem[id].lock);
+  r = kmem[id].freelist;
+  if(r)
+    kmem[id].freelist = r->next;
+  else{
+    //当前CPU链表为空，遍历其他CPU偷一页
+    for(int antid=0;antid<NCPU;++antid){
+      if(antid==id)continue;
+      acquire(&kmem[antid].lock);
+      r=kmem[antid].freelist;
+      if(r){
+        kmem[antid].freelist=r->next;
+        release(&kmem[antid].lock);
+        break;
+      }
+      release(&kmem[antid].lock);
+    }
+  }
+  release(&kmem[id].lock);
+  pop_off();
+
+  if(r)
+    memset((char*)r, 5, PGSIZE);
+  return (void*)r;
+}
+```
+
+### 怎么实现的
+
+这个任务把“所有 CPU 抢一把锁”改成“每个 CPU 大多数时间只抢自己的锁”。`push_off()` / `pop_off()` 很关键，因为 `cpuid()` 必须在关闭中断时使用，避免当前执行流在读取 CPU id 之后被切换到另一个 CPU 上。
+
+### 核心思想
+
+核心是降低共享热点。空闲页链表不一定必须全局唯一，只要保证每个页面只在某一个 freelist 中，并且跨 CPU steal 时正确加锁，就能在保证正确性的同时减少锁竞争。
+
+## 任务二：优化 buffer cache
+
+### 原始问题
+
+原始 xv6 的 buffer cache 使用一条全局 LRU 链表，由一把 `bcache.lock` 保护。不同 CPU 即使访问不同磁盘块，也会竞争同一把锁。
+
+### 实现的功能
+
+当前分支将 buffer cache 改成哈希桶：
+
+- 根据 `blockno` 计算 bucket。
+- 每个 bucket 有自己的链表和锁。
+- cache hit 时只锁对应 bucket。
+- cache miss 需要全局换出时，用 `eviction_lock` 串行化。
+- 用 `timestamp` 替代全局 LRU 链表移动。
+
+### 核心修改代码片段
+
+文件：`kernel/bio.c`
+
+#### 1. 定义 bucket 和哈希函数
 
 ```c
 #define NBUCKET 13
-#define HASH(blockno) ((blockno) % NBUCKET)
-```
+#define HASH(blockno)((blockno)%NBUCKET)
 
-每个桶由 `struct hashbuf` 表示：
-
-```c
-struct hashbuf {
+//hash桶是存储buf的，buf总共有三十个
+struct hashbuf{
   struct buf head;
   struct spinlock lock;
 };
 ```
 
-`bcache` 中包含多个桶：
+#### 2. 改造 bcache 结构
 
 ```c
-struct hashbuf buckets[NBUCKET];
+struct {
+  struct spinlock eviction_lock;   //仅用于换出时串行化
+  struct buf buf[NBUF];
+
+  struct hashbuf buckets[NBUCKET];   //散列桶
+} bcache;
 ```
 
-这样不同 block 会根据 `blockno` 分散到不同桶里。访问不同桶时，只需要拿对应桶的锁，不再集中竞争一把全局 `bcache.lock`。
-
-### 4. 换出阶段串行化
-
-哈希桶能减少命中路径的锁竞争，但 cache miss 时需要从所有桶里找一个可替换的 buffer。如果多个 CPU 同时做全局换出，容易出现重复选择、链表移动冲突或同一 block 被重复加入 cache 的问题。
-
-因此分支中新增：
+#### 3. 初始化所有 bucket
 
 ```c
-struct spinlock eviction_lock;
+void
+binit(void)
+{
+  struct buf *b;
+  char lockname[16];
+
+  initlock(&bcache.eviction_lock, "bcache_eviction");
+
+  for(int i=0;i<NBUCKET;++i){
+    snprintf(lockname,sizeof(lockname),"bcache_bucket_%d",i);
+    initlock(&bcache.buckets[i].lock,lockname);
+    bcache.buckets[i].head.prev=&bcache.buckets[i].head;
+    bcache.buckets[i].head.next=&bcache.buckets[i].head;
+  }
+
+  //初始全部挂到bucket[0]
+  for(b=bcache.buf;b<bcache.buf+NBUF;b++){
+    b->next=bcache.buckets[0].head.next;
+    b->prev=&bcache.buckets[0].head;
+    b->timestamp=0;
+    initsleeplock(&b->lock,"buffer");
+    bcache.buckets[0].head.next->prev=b;
+    bcache.buckets[0].head.next=b;
+  }
+}
 ```
 
-它只在 miss 后进入换出阶段时使用，保证同一时间只有一个 CPU 执行“扫描所有桶、选择 LRU、移动 buffer 到目标桶”的全局操作。
-
-这是一种折中设计：命中路径保持细粒度桶锁，复杂的换出路径用一把全局锁保证正确性。
-
-### 5. 用 timestamp 维护 LRU 语义
-
-原始 xv6 通过在全局链表中移动 `buf` 的位置表示最近使用顺序。改成哈希桶后，buffer 分散在多个桶里，再维护一条全局 LRU 链表会重新引入全局锁竞争。
-
-当前分支在 `kernel/buf.h` 的 `struct buf` 中新增：
+#### 4. cache hit：只查目标 bucket
 
 ```c
-uint timestamp;
+int bid=HASH(blockno);
+
+acquire(&bcache.buckets[bid].lock);
+for(b=bcache.buckets[bid].head.next;b!=&bcache.buckets[bid].head;b=b->next){
+  if(b->dev==dev && b->blockno==blockno){
+    b->refcnt++;
+    release(&bcache.buckets[bid].lock);
+    acquiresleep(&b->lock);
+    return b;
+  }
+}
+release(&bcache.buckets[bid].lock);
 ```
 
-当 `brelse()` 使 `refcnt` 降为 0 时，读取全局 `ticks` 并保存到 `b->timestamp`。换出时扫描所有桶，选择 `refcnt == 0` 且 `timestamp` 最小的 buffer，作为最久未使用的候选。
+命中路径只操作一个桶，因此不同 block 落在不同桶时可以并发访问。
 
-这保留了 LRU 的核心语义，同时避免每次释放 buffer 都要移动全局链表。
+#### 5. cache miss：用 eviction_lock 串行化换出
 
-## 怎么实现的
+```c
+acquire(&bcache.eviction_lock);
 
-### kalloc.c：拆分 kmem 锁
+//必须再查一次！！！
+//从释放桶锁到拿到 eviction_lock 之间，别的 CPU 可能已经把这个块加进了 cache
+acquire(&bcache.buckets[bid].lock);
+for(b=bcache.buckets[bid].head.next;b!=&bcache.buckets[bid].head;b=b->next){
+  if(b->dev==dev && b->blockno==blockno){
+    b->refcnt++;
+    release(&bcache.buckets[bid].lock);
+    release(&bcache.eviction_lock);
+    acquiresleep(&b->lock);
+    return b;
+  }
+}
+release(&bcache.buckets[bid].lock);
+```
 
-`kernel/kalloc.c` 的关键变化如下：
+这里二次检查很关键：第一次 miss 后到拿到 `eviction_lock` 之间，其他 CPU 可能已经把同一个 block 加入 cache。如果不复查，就可能出现同一个磁盘块对应多个 buffer 的错误。
 
-- `kmem` 从单个结构体改为 `kmem[NCPU]`。
-- `kinit()` 循环初始化每个 CPU 的锁。
-- `kfree()` 使用 `push_off()`/`pop_off()` 包住 `cpuid()`，避免读取 CPU id 期间被调度到其他 CPU。
-- `kfree()` 将释放的页面插入当前 CPU 的 freelist。
-- `kalloc()` 优先从当前 CPU freelist 取页面。
-- 当前 CPU freelist 为空时，遍历其他 CPU freelist 偷取页面。
+#### 6. 扫描所有 bucket 选择 LRU buffer
 
-这里的核心正确性点是：读 `cpuid()` 前必须关中断，否则当前执行流可能被调度到其他 CPU，导致把页面放错链表或拿错锁。
+```c
+struct buf *lru_b=0;
+int lru_bid=-1;
 
-### bio.c：拆分 bcache 锁
+for(int i=0;i<NBUCKET;++i){
+  acquire(&bcache.buckets[i].lock);
+  int found_new=0;
+  for(b=bcache.buckets[i].head.next;b!=&bcache.buckets[i].head;b=b->next){
+    if(b->refcnt==0 && (lru_b==0 || b->timestamp < lru_b->timestamp)){
+      if(lru_bid!=-1 && lru_bid!=i){
+        release(&bcache.buckets[lru_bid].lock);
+      }
+      lru_b=b;
+      lru_bid=i;
+      found_new=1;
+    }
+  }
+  if(!found_new && i!=lru_bid){
+    release(&bcache.buckets[i].lock);
+  }
+}
 
-`kernel/bio.c` 的 `bget()` 被改造成两段式流程。
+if(lru_b==0){
+  panic("bget:no buffers");
+}
+```
 
-第一段是命中查找：
+选择条件是 `refcnt == 0`，说明没有进程正在使用；`timestamp` 最小，说明最久没有被使用。
 
-- 根据 `HASH(blockno)` 计算目标桶。
-- 只加目标桶锁。
-- 如果找到匹配的 `(dev, blockno)`，增加 `refcnt`，释放桶锁，获取 buffer 的 sleep lock，然后返回。
+#### 7. 必要时把 LRU buffer 移到目标 bucket
 
-第二段是 miss 后换出：
+```c
+if(lru_bid!=bid){
+  //从原桶摘下
+  lru_b->next->prev=lru_b->prev;
+  lru_b->prev->next=lru_b->next;
+  release(&bcache.buckets[lru_bid].lock);
 
-- 获取 `eviction_lock`，串行化全局换出。
-- 再次检查目标桶，避免别的 CPU 在空窗期已经把目标 block 加入 cache。
-- 扫描所有桶，寻找 `refcnt == 0` 且 `timestamp` 最小的 buffer。
-- 如果候选 buffer 不在目标桶，将它从原桶摘下并挂入目标桶。
-- 更新 `dev`、`blockno`、`valid`、`refcnt`。
-- 释放桶锁和 `eviction_lock`，获取 buffer 的 sleep lock 后返回。
+  //挂到目标桶
+  acquire(&bcache.buckets[bid].lock);
+  lru_b->next=bcache.buckets[bid].head.next;
+  lru_b->prev = &bcache.buckets[bid].head;
+  bcache.buckets[bid].head.next->prev = lru_b;
+  bcache.buckets[bid].head.next = lru_b;
+}
 
-这里“miss 后再次检查目标桶”很重要。因为第一次释放桶锁到拿到 `eviction_lock` 之间，其他 CPU 可能已经完成了同一个 block 的加载；如果不复查，就可能破坏“一块磁盘 block 在 cache 中只有一个 buf”的不变量。
+lru_b->dev=dev;
+lru_b->blockno=blockno;
+lru_b->valid=0;
+lru_b->refcnt=1;
 
-### brelse/bpin/bunpin：只操作对应桶
+release(&bcache.buckets[bid].lock);
+release(&bcache.eviction_lock);
+acquiresleep(&lru_b->lock);
+return lru_b;
+```
 
-`brelse()`、`bpin()` 和 `bunpin()` 都改为：
+如果 LRU buffer 不在目标桶，需要先从原桶链表摘下，再挂入目标桶。这样后续根据 `HASH(blockno)` 查找时才能在正确 bucket 找到它。
 
-- 根据 `b->blockno` 计算桶 id。
-- 只获取对应桶锁。
-- 修改 `refcnt`。
+#### 8. brelse 中更新时间戳
 
-`brelse()` 在 `refcnt` 变为 0 时更新 `timestamp`，用于后续 LRU 选择。
+文件：`kernel/bio.c`
 
-### spinlock.c：锁统计和注释
+```c
+void
+brelse(struct buf *b)
+{
+  if(!holdingsleep(&b->lock))
+    panic("brelse");
 
-`kernel/spinlock.c` 中保留了 lock lab 的统计逻辑：
+  releasesleep(&b->lock);
 
-- 每次调用 `acquire()` 时增加 `lk->n`。
-- 自旋失败时增加 `lk->nts`。
-- `statslock()` 输出 `kmem` 和 `bcache` 相关锁的竞争统计。
+  int bid=HASH(b->blockno);
+  acquire(&bcache.buckets[bid].lock);
+  b->refcnt--;
 
-分支还补充了对 RISC-V 原子交换的解释：`__sync_lock_test_and_set` 最终会落到类似 `amoswap` 的原子指令；循环中不断尝试把 `lk->locked` 从 0 改成 1，成功则拿到锁，失败则继续自旋。
+  if (b->refcnt == 0) {
+    acquire(&tickslock);
+    b->timestamp=ticks;
+    release(&tickslock);
+  }
 
-## 核心思想
+  release(&bcache.buckets[bid].lock);
+}
+```
 
-`lock` 分支的核心是“用细粒度锁减少共享热点，同时保留必要的不变量”。
+文件：`kernel/buf.h`
 
-对于 `kalloc`：
+```c
+uint timestamp;   //原先做法是通过“在全局链表里挪位置”表示新旧顺序,现在使用时间戳来表示
+```
 
-- 共享热点是单个 `kmem.lock`。
-- 解决办法是按 CPU 拆分 freelist 和锁。
-- 为避免某个 CPU 缺页，增加跨 CPU steal。
+### 怎么实现的
 
-对于 `bcache`：
+这个任务把 bcache 的并发访问分成两类：
 
-- 共享热点是单个 `bcache.lock`。
-- 解决办法是按 blockno 哈希到多个 bucket，每个 bucket 一把锁。
-- 命中路径只锁一个 bucket。
-- miss 换出路径使用 `eviction_lock` 串行化，保证全局替换正确。
-- 用 `timestamp` 替代全局链表移动来保留 LRU 近似语义。
+- 常见路径：cache hit，只需要目标 bucket lock。
+- 少见路径：cache miss，需要全局选择可替换 buffer，因此用 `eviction_lock` 串行化。
 
-这个分支不是简单地“把一把锁拆成很多把锁”，更重要的是识别哪些操作可以并发，哪些操作必须串行。命中查找和 refcnt 更新可以局部化；跨桶换出和全局 LRU 选择则需要额外保护。
+这样既降低了常见路径的锁竞争，又避免了换出时破坏全局不变量。
 
-## 关键文件
+### 核心思想
 
-- `kernel/kalloc.c`：每 CPU freelist、`kalloc()` steal、`kfree()` 本地释放。
-- `kernel/bio.c`：哈希桶 bcache、桶锁、全局换出锁、timestamp LRU。
-- `kernel/buf.h`：为 `struct buf` 增加 `timestamp`。
-- `kernel/spinlock.c`：锁竞争统计和自旋锁原理注释。
-- `Makefile`：lock lab 下包含 `_kalloctest` 和 `_bcachetest`。
+核心是细粒度锁和不变量保护的平衡。bucket lock 提高并发，`eviction_lock` 保证全局换出正确。`timestamp` 则让 LRU 判断不再依赖一条全局链表，从而减少锁竞争。
 
-## 小结
+## 任务三：spinlock 统计与注释
 
-这个分支完成了 lock lab 最核心的性能优化：把高频路径上的全局锁竞争拆散。`kalloc` 通过每 CPU freelist 降低内存分配压力，`bcache` 通过哈希桶降低 block cache 访问压力。真正的关键在于并发不变量：同一个空闲页不能被重复分配，同一个磁盘 block 在 cache 中不能出现多个有效副本，refcnt 和链表移动必须被正确加锁保护。
+### 实现的功能
+
+`spinlock.c` 中保留并完善了 lock lab 的统计逻辑，用于观察哪些锁发生了严重竞争。
+
+### 核心修改代码片段
+
+文件：`kernel/spinlock.c`
+
+```c
+#ifdef LAB_LOCK
+    __sync_fetch_and_add(&(lk->n), 1);
+#endif
+```
+
+```c
+while(__sync_lock_test_and_set(&lk->locked, 1) != 0) {
+#ifdef LAB_LOCK
+    __sync_fetch_and_add(&(lk->nts), 1);
+#else
+   ;
+#endif
+}
+```
+
+含义：
+
+- `lk->n`：调用 `acquire()` 的次数。
+- `lk->nts`：自旋失败次数，也就是没有立刻拿到锁、需要继续等待的次数。
+
+文件：`kernel/spinlock.c`
+
+```c
+int
+statslock(char *buf, int sz) {
+  int n;
+  int tot = 0;
+
+  acquire(&lock_locks);
+  n = snprintf(buf, sz, "--- lock kmem/bcache stats\n");
+  for(int i = 0; i < NLOCK; i++) {
+    if(locks[i] == 0)
+      break;
+    if(strncmp(locks[i]->name, "bcache", strlen("bcache")) == 0 ||
+       strncmp(locks[i]->name, "kmem", strlen("kmem")) == 0) {
+      tot += locks[i]->nts;
+      n += snprint_lock(buf +n, sz-n, locks[i]);
+    }
+  }
+  ...
+  release(&lock_locks);
+  return n;
+}
+```
+
+### 核心思想
+
+锁优化不能只靠感觉，需要通过统计看竞争是否下降。`kalloctest` 和 `bcachetest` 会关注 `kmem`、`bcache` 相关锁的自旋次数，优化目标就是让这些热点锁的争用明显下降。
+
+## 总结
+
+`lock` 分支的三个任务可以概括为：
+
+- `kalloc`：把一个全局 freelist 拆成每 CPU freelist，减少内存分配锁竞争。
+- `bcache`：把一个全局 cache 链表拆成多个哈希桶，减少块缓存锁竞争。
+- `spinlock`：通过统计自旋失败次数观察锁竞争。
+
+最核心的代码思想是：高频局部操作用细粒度锁，全局复杂操作保留必要的串行化。这样既能提升并发，又不破坏 xv6 内核必须维护的数据一致性。
 
