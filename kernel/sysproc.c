@@ -46,9 +46,19 @@ sys_sbrk(void)
 
   if(argint(0, &n) < 0)
     return -1;
-  addr = myproc()->sz;
-  if(growproc(n) < 0)
-    return -1;
+
+  struct proc *p = myproc();
+  addr = p->sz;
+  uint64 sz = p->sz;
+
+  if(n > 0) {
+    p->sz += n;            // lazy: 增长不分配
+  } else if(sz + n > 0) {
+    sz = uvmdealloc(p->pagetable, sz, sz + n);   // 收缩走原路径
+    p->sz = sz;
+  } else {
+    return -1;             // 缩到 0 以下: 拒绝
+  }
   return addr;
 }
 
