@@ -10,15 +10,34 @@
 #define STACK_SIZE  8192
 #define MAX_THREAD  4
 
+//context 结构体只需要保存被调用者必须保证不变的寄存器
+struct context {
+  uint64 ra;
+  uint64 sp;
 
+  // s0 - s11：这些是 Callee-saved 寄存器
+  uint64 s0;
+  uint64 s1;
+  uint64 s2;
+  uint64 s3;
+  uint64 s4;
+  uint64 s5;
+  uint64 s6;
+  uint64 s7;
+  uint64 s8;
+  uint64 s9;
+  uint64 s10;
+  uint64 s11;
+};
 struct thread {
   char       stack[STACK_SIZE]; /* the thread's stack */
   int        state;             /* FREE, RUNNING, RUNNABLE */
+  struct context context;
 
 };
 struct thread all_thread[MAX_THREAD];
 struct thread *current_thread;
-extern void thread_switch(uint64, uint64);
+extern void thread_switch(struct context*,struct context*);
               
 void 
 thread_init(void)
@@ -32,6 +51,7 @@ thread_init(void)
   current_thread->state = RUNNING;
 }
 
+//在所有处于 RUNNABLE 状态的线程中选一个，然后把 CPU 的控制权“移交”过去。
 void 
 thread_schedule(void)
 {
@@ -56,13 +76,20 @@ thread_schedule(void)
   }
 
   if (current_thread != next_thread) {         /* switch threads?  */
+    //准备切换
     next_thread->state = RUNNING;
+
+    // 1. 暂存一下当前的线程指针（老线程）
     t = current_thread;
     current_thread = next_thread;
     /* YOUR CODE HERE
      * Invoke thread_switch to switch from t to next_thread:
      * thread_switch(??, ??);
      */
+    // 2. 调用汇编实现的 thread_switch
+    // 参数1：&old_t->context —— 把当前所有寄存器存入这个地址
+    // 参数2：&current_thread->context —— 从这个地址加载之前存好的寄存器
+    thread_switch(&t->context,&current_thread->context);
   } else
     next_thread = 0;
 }
@@ -72,11 +99,24 @@ thread_create(void (*func)())
 {
   struct thread *t;
 
+  // 1. 在线程池里找一个坑位
   for (t = all_thread; t < all_thread + MAX_THREAD; t++) {
     if (t->state == FREE) break;
   }
-  t->state = RUNNABLE;
+  t->state = RUNNABLE;// 设为就绪态
   // YOUR CODE HERE
+  // 2. 清空上下文，确保没有残留数据
+  memset(&t->context,0,sizeof(t->context));
+
+  // 3. 关键：设置返回地址 (ra)
+  //当 thread_switch 第一次切换到这个线程并执行 'ret' 时，
+  //CPU 会直接跳到 func 对应的地址开始执行
+  t->context.ra=(uint64)func;
+
+  // 4. 关键：设置自己的独立栈 (sp)
+  // RISC-V 的栈是从高地址向低地址增长的。
+  // t->stack 是数组首地址（低位），所以要加 STACK_SIZE 指向数组末尾（高位）。
+  t->context.sp=(uint64)t->stack+STACK_SIZE;
 }
 
 void 
