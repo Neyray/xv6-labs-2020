@@ -1,0 +1,446 @@
+# MIT xv6 Lab thread 分支实现说明
+
+## 分支概览
+
+`thread` 分支的核心是理解 **"线程切换的本质就是保存和恢复一组寄存器"**。lab 一共三个小任务：
+
+- 任务一（已完成）：**Uthread —— Switching between threads**。在用户态实现一个最朴素的协作式线程库：补全 `thread_create`、`thread_schedule`、`thread_switch` 三段代码，让 `uthread` 可以在 `thread_a / thread_b / thread_c` 之间切换。
+- 任务二（未完成）：**Using threads**。给一个并发哈希表 `notxv6/ph.c` 加锁，让多线程 `put/get` 不丢键。
+- 任务三（未完成）：**Barrier**。在 `notxv6/barrier.c` 中用 `pthread_mutex_t` + `pthread_cond_t` 实现可重用的多线程屏障。
+
+任务一是这条主线最有"操作系统味儿"的一步 —— 它和 xv6 内核的 `swtch` 几乎一模一样，但跑在**用户态**，没有内核帮你存 trapframe，所有寄存器都得自己用汇编保存。也因此它把"线程"和"上下文"两个概念压成了一张 14 个寄存器的小表。
+
+> 任务二（`ph.c`）和任务三（`barrier.c`）在当前分支里**还是骨架**，只引入了文件本身，函数体只有 `// YOUR CODE HERE` 注释。下文最后一节给出补完思路备忘。
+
+---
+
+## 背景知识：线程到底"切换"了什么？
+
+要把这一节真正理解透，必须搞清楚一件事：**两个线程的代码是同一份，差别全在寄存器**。
+
+### 1. CPU 跑一个程序的"现场"是什么？
+
+CPU 在某一时刻正在执行某行代码，所需要的全部"状态"其实就是这些：
+
+- **`pc`**（程序计数器）—— 下一条要执行的指令地址；
+- **`sp`**（栈指针）—— 当前栈顶；
+- **若干通用寄存器** —— 局部变量、中间结果、函数参数等；
+- **内存里的栈** —— 函数调用帧、局部变量、调用历史。
+
+把这些"现场"保存起来，再换上另一份现场，CPU 就毫无察觉地"成了另一个线程"。
+
+### 2. 但为什么 xv6 `swtch` 只保存 14 个寄存器？
+
+RISC-V 的整数寄存器有 32 个（x0~x31）。但 RISC-V 的 **calling convention** 把它们分成两类：
+
+| 类别 | 寄存器 | 谁负责保护 |
+| --- | --- | --- |
+| **Caller-saved**（调用者保存） | `ra, t0-t6, a0-a7` | 调用者认为它们随时会被覆盖，需要的话调用前自己存到栈上 |
+| **Callee-saved**（被调用者保存） | `sp, s0-s11`（fp 就是 s0） | 被调用函数承诺"用了就给恢复回来"，否则不能用 |
+
+`thread_switch` 是一个**普通函数**，调用它的位置（比如 `thread_schedule`）按 C 函数调用约定来 —— 也就是说调用者**已经把 caller-saved 的 a0~a7、t0~t6 自己存到栈上了**。`thread_switch` 只需要负责被调用者保存的 callee-saved 寄存器。
+
+callee-saved 寄存器一共 14 个：
+
+```text
+ra       1 个    返回地址（thread_switch 完了 ret 到哪）
+sp       1 个    栈指针（哪个栈是这个线程的）
+s0~s11   12 个   通用寄存器
+```
+
+这就是为什么 `uthread.c` 里 `struct context` 只有 14 个字段。**少存一个都不行，多存一个都没必要**。
+
+### 3. `pc` 怎么存的？为什么 `struct context` 里看不到 `pc`？
+
+这是最让初学者疑惑的点。答案是：
+
+> `pc` 不在 `struct context` 里，**它被借用 `ra` 表达**。
+
+`thread_switch` 用 `ret` 指令返回。`ret` 在 RISC-V 上等价于 `jr ra` —— 跳到 `ra` 寄存器里的地址执行。所以"下一条指令地址"就是恢复出来的 `ra`。
+
+- 当一个线程**第一次**被切换上来：`thread_create` 把 `context.ra` 写成线程函数 `func` 的地址，所以 `ret` 跳到 `func` 开头。
+- 当一个线程**之前 yield 过、被切回来**：`context.ra` 是上一次 `thread_switch` 调用之后那一行的地址（因为汇编 `sd ra, 0(a0)` 存的就是当时的 ra），所以 `ret` 跳回 `thread_switch` 的下一行，自然继续在 `thread_schedule` 里往下跑。
+
+这两种情况**靠的是同一段切换代码**，差别只在 `context.ra` 的来源。这就是为什么 `thread_create` 里那行 `t->context.ra = (uint64)func` 是整段代码最 elegant 的设计 —— 它伪造了一个"上次切换是在 func 开头被切走的"假象。
+
+### 4. 用户态线程库 vs 内核线程
+
+xv6 的 `swtch.S` 也是 14 个寄存器的存取（一模一样的代码模式）。区别在于：
+
+| 维度 | 内核 swtch | uthread |
+| --- | --- | --- |
+| 谁触发切换 | 时钟中断 → 调度器 | 线程显式调用 `thread_yield()` |
+| 保存什么 | callee-saved 14 个寄存器 + 中断处理时硬件帮存了 caller-saved | callee-saved 14 个寄存器（caller-saved 由 C 编译器入栈） |
+| 栈在哪 | 每进程一个内核栈 | 每线程一个 8KB 数组栈 |
+| 抢占？ | 是，被时钟中断打断 | 否，**协作式**：线程必须主动 yield |
+
+理解这个对照表后，再看 `uthread.c` 就完全无神秘感了。
+
+### 5. 为什么是 8192 字节栈？
+
+```c
+#define STACK_SIZE  8192
+```
+
+8KB 是一个**经验取值**：
+
+- 太小（比如 1KB）会让普通的 C 函数调用一不小心就栈溢出；
+- 太大（比如 64KB）线程 4 个就 256KB，对 xv6 这种小系统来说浪费；
+- 8KB 足够 `printf` + 几层 C 函数调用 + 小局部变量。
+
+栈在 RISC-V 中**从高地址向低地址增长**。`t->stack` 是数组首地址（低地址），所以 `thread_create` 中：
+
+```c
+t->context.sp = (uint64)t->stack + STACK_SIZE;
+```
+
+把 sp 指到数组末尾 —— 即栈"顶"。函数调用时 sp 会减小，把空间分配给新栈帧。
+
+### 6. 协作式调度的一切真相
+
+uthread 是**协作式**的：
+
+- 不靠时钟中断；
+- 线程必须自己调用 `thread_yield()`；
+- 一旦某个线程死循环不让出，所有线程都饿死。
+
+`thread_yield()` 把自己设成 `RUNNABLE`，然后调 `thread_schedule()` 找下一个可跑的，最后通过 `thread_switch` 把寄存器一换 —— 切换发生在**两个用户函数之间**，完全不需要内核参与。
+
+整个 lab 的精彩之处就在于：用 **40 行汇编 + 一个 14 字段结构体**，在用户态自造了一个线程系统。
+
+---
+
+## 任务一：Uthread —— Switching between threads
+
+### 实现的功能
+
+补完 `user/uthread.c` 中的 `thread_create`、`thread_schedule`，并补全 `user/uthread_switch.S` 的全部汇编，让以下程序能跑：
+
+```c
+thread_init();
+thread_create(thread_a);
+thread_create(thread_b);
+thread_create(thread_c);
+thread_schedule();
+```
+
+预期输出 `thread_a / thread_b / thread_c` 三个线程交替打印 0..99，结束时各自打印 "exit"。
+
+### 修改 1：定义线程上下文
+
+文件：`user/uthread.c`
+
+```c
+//context 结构体只需要保存被调用者必须保证不变的寄存器
+struct context {
+  uint64 ra;
+  uint64 sp;
+
+  // s0 - s11：这些是 Callee-saved 寄存器
+  uint64 s0;
+  uint64 s1;
+  uint64 s2;
+  uint64 s3;
+  uint64 s4;
+  uint64 s5;
+  uint64 s6;
+  uint64 s7;
+  uint64 s8;
+  uint64 s9;
+  uint64 s10;
+  uint64 s11;
+};
+
+struct thread {
+  char       stack[STACK_SIZE]; /* the thread's stack */
+  int        state;             /* FREE, RUNNING, RUNNABLE */
+  struct context context;
+};
+```
+
+每个 `struct thread` 里有自己独立的 8KB 栈 + 状态字段 + 上下文。这三件东西就是一个线程的全部。
+
+> 注意 `struct context` 字段顺序必须和汇编里 `sd/ld` 的 offset 完全对齐：`ra=0(a0), sp=8(a0), s0=16(a0)... s11=104(a0)`。
+
+### 修改 2：`thread_create` —— 伪造一次"刚被切走"的现场
+
+文件：`user/uthread.c`
+
+```c
+void
+thread_create(void (*func)())
+{
+  struct thread *t;
+
+  // 1. 在线程池里找一个坑位
+  for (t = all_thread; t < all_thread + MAX_THREAD; t++) {
+    if (t->state == FREE) break;
+  }
+  t->state = RUNNABLE;       // 设为就绪态
+
+  // 2. 清空上下文，确保没有残留数据
+  memset(&t->context, 0, sizeof(t->context));
+
+  // 3. 关键：设置返回地址 (ra)
+  // 当 thread_switch 第一次切换到这个线程并执行 'ret' 时，
+  // CPU 会直接跳到 func 对应的地址开始执行
+  t->context.ra = (uint64)func;
+
+  // 4. 关键：设置自己的独立栈 (sp)
+  // RISC-V 的栈是从高地址向低地址增长的。
+  // t->stack 是数组首地址（低位），所以要加 STACK_SIZE 指向数组末尾（高位）。
+  t->context.sp = (uint64)t->stack + STACK_SIZE;
+}
+```
+
+三件事：
+
+1. **找空槽**：在 `all_thread[MAX_THREAD]` 数组里找一个 `state == FREE` 的；
+2. **伪造 `ra`**：把线程函数的地址塞进 context.ra —— 这样第一次切换到它、`thread_switch` 末尾的 `ret` 一执行，CPU 立刻跳到线程函数开头；
+3. **设置独立 sp**：每个线程的栈是 `stack[]` 数组，sp 必须指到数组尾部（高地址）。
+
+s0~s11 保持 0 没问题：线程刚开始执行 func，func 用到这些寄存器之前会先把自己要用的部分压栈（编译器生成的 prologue 干这件事），所以"初始值"无所谓。
+
+### 修改 3：`thread_schedule` —— 选 + 切
+
+文件：`user/uthread.c`
+
+```c
+//在所有处于 RUNNABLE 状态的线程中选一个，然后把 CPU 的控制权"移交"过去。
+void
+thread_schedule(void)
+{
+  struct thread *t, *next_thread;
+
+  /* Find another runnable thread. */
+  next_thread = 0;
+  t = current_thread + 1;
+  for(int i = 0; i < MAX_THREAD; i++){
+    if(t >= all_thread + MAX_THREAD)
+      t = all_thread;
+    if(t->state == RUNNABLE) {
+      next_thread = t;
+      break;
+    }
+    t = t + 1;
+  }
+
+  if (next_thread == 0) {
+    printf("thread_schedule: no runnable threads\n");
+    exit(-1);
+  }
+
+  if (current_thread != next_thread) {         /* switch threads? */
+    next_thread->state = RUNNING;
+
+    // 1. 暂存一下当前的线程指针（老线程）
+    t = current_thread;
+    current_thread = next_thread;
+
+    // 2. 调用汇编实现的 thread_switch
+    // 参数1：&old_t->context —— 把当前所有寄存器存入这个地址
+    // 参数2：&current_thread->context —— 从这个地址加载之前存好的寄存器
+    thread_switch(&t->context, &current_thread->context);
+  } else
+    next_thread = 0;
+}
+```
+
+几个值得展开的点：
+
+- **从 `current_thread + 1` 开始扫**：避免连续选中自己，做一次 round-robin；
+- **回卷**：扫到数组末尾要回到 `all_thread[0]` 继续，否则只能从当前位置往后扫一次；
+- **暂存 `t = current_thread`**：因为下一行就要 `current_thread = next_thread`，但 `thread_switch` 还需要"老线程"的 context 地址来存寄存器。**这个先更新 `current_thread` 再调 `thread_switch` 的顺序很关键**：切换之后再回来时，`current_thread` 已经是"切回的那个线程"，逻辑自洽。
+- **`thread_switch(&t->context, &next->context)`**：第一个参数是"要存到哪儿"，第二个参数是"要从哪儿加载"。对应汇编里的 a0、a1。
+
+### 修改 4：`thread_switch` 汇编 —— 14 个寄存器的存取
+
+文件：`user/uthread_switch.S`
+
+```asm
+.text
+
+.globl thread_switch
+thread_switch:
+    /* save the old thread's registers (offsets into context @ a0) */
+    sd ra,    0(a0)
+    sd sp,    8(a0)
+    sd s0,   16(a0)
+    sd s1,   24(a0)
+    sd s2,   32(a0)
+    sd s3,   40(a0)
+    sd s4,   48(a0)
+    sd s5,   56(a0)
+    sd s6,   64(a0)
+    sd s7,   72(a0)
+    sd s8,   80(a0)
+    sd s9,   88(a0)
+    sd s10,  96(a0)
+    sd s11, 104(a0)
+
+    /* restore the new thread's registers (offsets into context @ a1) */
+    ld ra,    0(a1)
+    ld sp,    8(a1)
+    ld s0,   16(a1)
+    ld s1,   24(a1)
+    ld s2,   32(a1)
+    ld s3,   40(a1)
+    ld s4,   48(a1)
+    ld s5,   56(a1)
+    ld s6,   64(a1)
+    ld s7,   72(a1)
+    ld s8,   80(a1)
+    ld s9,   88(a1)
+    ld s10,  96(a1)
+    ld s11, 104(a1)
+
+    ret    /* return to ra */
+```
+
+这段汇编就是整个 lab 的心脏。逐行解读：
+
+- **`a0` 是第一个参数地址、`a1` 是第二个参数地址**（RISC-V 函数调用约定）；
+- **`sd ra, 0(a0)`**：`sd` = store doubleword（8 字节），把 `ra` 写到 `*((uint64*)(a0 + 0))`，对应 `struct context` 里的 `ra` 字段；
+- **依次存 sp / s0..s11**：14 个寄存器精确对应 14 个偏移；
+- **再 `ld` 把新线程的现场加载回来**：完全对称；
+- **`ret`**：等价于 `jr ra`。注意这里的 `ra` 已经是上一行 `ld ra, 0(a1)` 加载好的"新线程的 ra"，所以会跳到新线程上次被切走时的下一行（或第一次时跳到 `func`）。
+
+为什么这一段不需要保存 `a0`、`a1`、`t0`-`t6`、`a0`-`a7`？因为它们是 caller-saved —— C 编译器在调用 `thread_switch` 前，**如果**调用者需要保留这些寄存器的值，自己已经把它们压到栈上了；如果调用者不需要，也无所谓被破坏。`thread_switch` 不用管。
+
+为什么不需要管 `pc`？前面已说，`pc` 借用 `ra` 表达，`ret` 一执行就跳到新线程的"返回地址"。
+
+### 实现思路总结
+
+把 `thread_create / thread_schedule / thread_switch` 三个函数串起来看：
+
+```text
+thread_create(func)
+   伪造 context: ra = func, sp = stack 末尾
+   state = RUNNABLE
+
+thread_schedule()
+   找下一个 RUNNABLE 的线程 next
+   thread_switch(&old.context, &next.context)
+        ┌──────────── 汇编 ────────────┐
+        │ sd ra/sp/s0..s11, &old.ctx   │  ← 老线程现场存到自己 context
+        │ ld ra/sp/s0..s11, &next.ctx  │  ← 新线程现场从自己 context 加载
+        │ ret                          │  ← 跳到新线程的 ra
+        └──────────────────────────────┘
+   //（从汇编 ret 那一刻起，CPU 已经是 next 线程了）
+   //（如果 next 是第一次跑，ra=func，直接跳进 func 开头）
+   //（如果 next 之前 yield 过，ra=上次 yield 后的下一行，回到 thread_schedule 内部继续）
+
+thread_yield()
+   current_thread->state = RUNNABLE
+   thread_schedule()      ← 再次进入选下个线程
+```
+
+### 核心思想
+
+uthread 把整个"线程"概念压成了**"一组寄存器 + 一段栈 + 一个函数指针"**。这种压缩对理解操作系统至关重要：
+
+> 线程不是什么"轻量级进程"，而是 **"调度单位"——CPU 一次只能跑一个上下文，所谓多线程就是若干份上下文在同一份代码上被反复换上换下**。
+
+理解这一点后再去看：
+
+- xv6 的 `kernel/swtch.S` —— 几乎和 `uthread_switch.S` 一模一样，只是改名 + 在 `proc->context` 上跑；
+- Linux 的 `__switch_to`（更复杂，因为要管 FPU/CR3/segments）；
+- libco / boost::context —— 用户态协程库，逻辑同 uthread；
+- Goroutine / async-await —— 编译器或 runtime 做了 context 切换的语法糖。
+
+它们都是同一个模式。
+
+---
+
+## 任务二（未完成）：哈希表加锁 `notxv6/ph.c`
+
+### 现状
+
+`ph.c` 是一个标准 Linux 平台上的多线程哈希表测试（注意它不是 xv6 用户程序，而是 `notxv6/` 目录下的 host 程序，用 `pthread` 在本地编译运行）。当前代码完全没有锁，`put_thread` 并发执行会丢键。
+
+### 思路备忘
+
+```c
+pthread_mutex_t locks[NBUCKET];     // 每个 bucket 一把锁
+
+void bucket_locks_init(){
+  for(int i = 0; i < NBUCKET; i++)
+    pthread_mutex_init(&locks[i], NULL);
+}
+
+static void put(int key, int value){
+  int i = key % NBUCKET;
+  pthread_mutex_lock(&locks[i]);
+  // ... 原 put 逻辑 ...
+  pthread_mutex_unlock(&locks[i]);
+}
+```
+
+> 关键点：**只锁 bucket，不锁全表**。如果用一把全局锁，2 线程吞吐反而比 1 线程低（因为线程切换开销），过不了 grade。`get` 路径 lab 给的提示是**不加锁也行**（grade 不要求 `get` 严格无冲突），因为加了反而降低吞吐。这跟前面 `lock` lab 里 bcache 的 bucket lock 思想完全一致。
+
+---
+
+## 任务三（未完成）：Barrier `notxv6/barrier.c`
+
+### 现状
+
+`barrier()` 函数体是空的，所有线程都在跑断言 `assert(i == t)` —— 必须让所有线程都到齐才进入下一轮。
+
+### 思路备忘
+
+```c
+static void barrier(){
+  pthread_mutex_lock(&bstate.barrier_mutex);
+
+  bstate.nthread++;
+  if(bstate.nthread == nthread){
+    // 最后一个到的线程：递增 round，唤醒所有人
+    bstate.round++;
+    bstate.nthread = 0;
+    pthread_cond_broadcast(&bstate.barrier_cond);
+  } else {
+    // 不是最后一个：等其他人
+    pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex);
+  }
+
+  pthread_mutex_unlock(&bstate.barrier_mutex);
+}
+```
+
+关键点：
+
+- **`pthread_cond_wait` 必须在持有 mutex 的情况下调用**。它会**原子地**释放 mutex 并睡眠；被 `broadcast` 唤醒后又**原子地**重新拿到 mutex 才返回。这就避免了"我刚 unlock 准备 sleep，结果别人 broadcast 在我 sleep 之前"的丢失唤醒。
+- **`broadcast` 一定要在改完 `round / nthread` 之后**，否则被唤醒的线程拿到 mutex 时看到的 round 还是旧值。
+- **不需要为 round 加额外的判断循环**：`pthread_cond_broadcast` 不会丢，且每个线程从 wait 返回后就直接走出函数，再次进 barrier 时是新一轮。
+
+---
+
+## 总结
+
+`thread` 分支已完成的 Uthread 任务，本质是把内核里 `swtch.S` 的"上下文切换"机制原样搬到用户态：
+
+- **14 个寄存器的存取就是一切**（ra + sp + s0~s11）；
+- **`ra` 承担了 `pc` 的角色**，`ret` 完成跳转；
+- **`thread_create` 通过伪造 ra 让新线程"看起来像被切走过"**，从而在第一次被选上时无缝跳到 func；
+- **协作式调度靠显式 `thread_yield()` 配合 `thread_switch`**，没有任何内核参与。
+
+最关键的三段代码可以放一起：
+
+```c
+// uthread.c — 伪造现场
+t->context.ra = (uint64)func;
+t->context.sp = (uint64)t->stack + STACK_SIZE;
+
+// uthread.c — 触发切换
+thread_switch(&t->context, &current_thread->context);
+
+// uthread_switch.S — 真正的切换
+sd ra, 0(a0); ... sd s11, 104(a0)   // 存老
+ld ra, 0(a1); ... ld s11, 104(a1)   // 取新
+ret                                  // 跳到新线程的 ra
+```
+
+吃透这套，xv6 后面 `kernel/swtch.S`、`scheduler()`、`sched()` 三段代码就只剩"换了张皮"的复习题；再往后看 Linux `switch_to`、协程库、Go 的 `gopark/goready`，都是同一种东西的不同包装。
+
+任务二（ph.c 加锁）和任务三（barrier）属于 pthread API 应用题，逻辑短但落地需要小心 condition variable 的"原子释放 + 重获锁"语义。等后续补完。
+
