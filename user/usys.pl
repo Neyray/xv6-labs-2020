@@ -36,3 +36,6 @@ entry("getpid");
 entry("sbrk");
 entry("sleep");
 entry("uptime");
+#这个文件会自动生成 user/usys.S，不用手动改 usys.S
+entry("sigalarm");
+entry("sigreturn");

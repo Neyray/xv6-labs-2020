@@ -23,6 +23,9 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+//两个实际执行的函数需要声明
+int sigalarm(int ticks,void(*handler)());
+int sigreturn(void);
 
 // ulib.c
 int stat(const char*, struct stat*);

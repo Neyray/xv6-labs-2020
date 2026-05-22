@@ -17,6 +17,7 @@ struct spinlock pid_lock;
 
 extern void forkret(void);
 static void wakeup1(struct proc *chan);
+//在allocproc()之前声明freeproc()
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
@@ -121,6 +122,22 @@ found:
     return 0;
   }
 
+  //为alarm_trapframe分配内存
+  //当定时器触发、准备跳转到用户自定义的 handler 之前，
+  //操作系统需要用这个特殊的 trapframe 备份用户当前的寄存器状态（以便后续恢复）。
+  if((p->alarm_trapframe=(struct trapframe*)kalloc())==0){
+	  //如果kalloc()分配内存失败
+	  freeproc(p);//释放已经为该进程分配的其他资源
+	  release(&p->lock);//释放进程锁
+	  return 0;//表示失败的指针，终止进程分配
+  }
+
+  //初始化闹钟的控制状态字段
+  p->is_alarming = 0;// 状态标志位：0 表示当前没有正在执行的闹钟处理函数。
+  p->alarm_interval = 0;// 之后用户会通过 `sigalarm(ticks, handler)` 系统调用来修改这个值
+  p->alarm_handler = 0;// 存放用户在用户态自定义的、当闹钟触发时需要跳转过去执行的函数地址。
+  p->ticks_count = 0;// 当 ticks_count 累加到等于 alarm_interval 时，就会触发闹钟。
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -141,6 +158,16 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+
+  if(p->alarm_trapframe)
+	    kfree((void*)p->alarm_trapframe);
+  p->alarm_trapframe = 0;
+
+  p->is_alarming = 0;
+  p->alarm_interval = 0;
+  p->alarm_handler = 0;
+  p->ticks_count = 0;
+
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;

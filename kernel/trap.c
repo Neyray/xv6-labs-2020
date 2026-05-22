@@ -77,9 +77,27 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+  // 2代表时钟中断
+  if(which_dev == 2){
+	  //检查用户是否开启了闹钟功能+如果当前进程已经在执行闹钟处理函数了，就停止计数，直到它执行完 sigreturn
+	  if(p->alarm_interval>0 && p->is_alarming==0){
+		  p->ticks_count++;
 
+		  //当计数达到用户设定的阈值时，触发闹钟。
+		  if(p->ticks_count>=p->alarm_interval){
+			  //在跳转之前，把当前的寄存器快照（p->tf）备份到我们申请好的 alarm_trapframe 中
+			  memmove(p->alarm_trapframe,p->trapframe,sizeof(struct trapframe));
+
+			  //epc决定了当 CPU 从内核态返回用户态时，第一条指令从哪里开始执行。通过把它改成 alarm_h
+			  //andler 的地址，CPU 下一秒就会跑去执行用户写的处理函数。
+			  p->trapframe->epc=p->alarm_handler;
+
+			  p->ticks_count=0;
+			  p->is_alarming=1;
+		  }
+	  }
+    yield();
+  }
   usertrapret();
 }
 

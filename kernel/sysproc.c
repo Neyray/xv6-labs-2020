@@ -95,3 +95,43 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_sigalarm(void)
+{
+  int ticks;
+  uint64 handler;
+
+  //从寄存器提取第0个参数（闹钟周期n）
+  if(argint(0, &ticks) < 0)
+     return -1;
+
+  //提取第1个参数（用户定义的处理函数的内存地址）
+  if(argaddr(1, &handler) < 0)
+	  return -1;
+
+  struct proc *p = myproc();
+
+  p->alarm_interval = ticks;
+  p->alarm_handler = handler;
+  p->ticks_count = 0;
+  p->is_alarming = 0;
+
+  return 0;
+}
+
+//当用户定义的 handler 执行完毕后，必须调用这个系统调用来回到被中断打断的原始代码行。
+uint64
+sys_sigreturn(void)
+{
+  struct proc *p = myproc();
+
+  //将之前备份在 alarm_trapframe 里的所有寄存器状态，原封不动地覆盖回当前的 p->trapframe）。
+  memmove(p->trapframe, p->alarm_trapframe, sizeof(struct trapframe));
+
+  //将标志位重新设为0，这相当于解锁
+  p->is_alarming = 0;
+
+  //如果直接返回 0，内核会自动把 a0 改成 0，这可能会破坏被中断程序原本在 a0 里的值
+  return p->trapframe->a0;
+}
